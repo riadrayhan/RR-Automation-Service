@@ -28,30 +28,103 @@
     const data = await chrome.storage.local.get([xlsxKey, tsKey, formatKey]);
     const b64 = data[xlsxKey];
     const ts = data[tsKey];
-    const format = data[formatKey] || "xlsx";
+    let format = data[formatKey] || "";
     if (!b64) return false;
     const buf = base64ToArrayBuffer(b64);
+
+    // Auto-detect if format wasn't stored or is wrong.
+    if (!format) {
+      const v = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
+      const isZip = v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04;
+      format = isZip ? "xlsx" : "csv";
+    }
+
     let wb;
+    let parseErr = null;
     try {
       if (format === "csv") {
-        // Decode bytes as text and parse as CSV. Strip UTF-8 BOM if present.
         let text = new TextDecoder("utf-8").decode(new Uint8Array(buf));
         if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-        wb = XLSX.read(text, { type: "string", raw: false });
-      } else {
-        if (!looksLikeXlsx(buf)) {
-          subtitle.innerHTML = '<span class="empty">Stored data is not a valid .xlsx (zip signature missing).</span>';
-          return false;
+        // First try SheetJS auto-detect (handles ,  ;  tab  | delimiters).
+        wb = XLSX.read(text, { type: "string", raw: true });
+        // If SheetJS gave us only one column or empty, do a manual fallback.
+        const firstSheet = wb.SheetNames[0] && wb.Sheets[wb.SheetNames[0]];
+        const sampleRows = firstSheet ? XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: "" }) : [];
+        const looksSingleCol = sampleRows.length > 0 && sampleRows.every((r) => r.length <= 1);
+        if (!sampleRows.length || looksSingleCol) {
+          wb = parseCsvManual(text);
         }
+      } else {
         wb = XLSX.read(buf, { type: "array" });
       }
     } catch (e) {
-      subtitle.innerHTML = '<span class="empty">Parse error: ' + escapeHtml(e.message) + '</span>';
+      parseErr = e;
+    }
+
+    if (parseErr || !wb || !wb.SheetNames.length) {
+      // Show diagnostic so user can see what was actually captured.
+      const previewText = (() => {
+        try {
+          let t = new TextDecoder("utf-8").decode(new Uint8Array(buf, 0, Math.min(800, buf.byteLength)));
+          if (t.charCodeAt(0) === 0xFEFF) t = t.slice(1);
+          return t;
+        } catch (_) { return "(non-text bytes)"; }
+      })();
+      subtitle.innerHTML = '<span class="empty">Parse failed (' + escapeHtml((parseErr && parseErr.message) || "empty workbook") +
+        '). Format=' + escapeHtml(format) + ', bytes=' + buf.byteLength + '.</span>';
+      body.innerHTML = '<div class="doc-h1">Captured raw content (first 800 chars)</div>' +
+        '<pre style="white-space:pre-wrap;word-break:break-all;background:#f7f7f7;padding:12px;border:1px solid #ddd;border-radius:4px;font-family:Consolas,monospace;font-size:11pt">' +
+        escapeHtml(previewText) + '</pre>';
       return false;
     }
+
     renderWorkbook(wb, ts);
     renderProgress({ text: "Done. Data displayed.", kind: "ok", progress: 100 });
     return true;
+  }
+
+  // Manual CSV parser fallback — handles quoted fields, escaped quotes, common delimiters.
+  function parseCsvManual(text) {
+    // Detect delimiter from the first line.
+    const firstNl = text.indexOf("\n");
+    const firstLine = firstNl >= 0 ? text.slice(0, firstNl) : text;
+    const counts = {
+      ",": (firstLine.match(/,/g) || []).length,
+      ";": (firstLine.match(/;/g) || []).length,
+      "\t": (firstLine.match(/\t/g) || []).length,
+      "|": (firstLine.match(/\|/g) || []).length
+    };
+    let delim = ",";
+    let best = -1;
+    for (const k in counts) if (counts[k] > best) { best = counts[k]; delim = k; }
+
+    const rows = [];
+    let cur = [];
+    let field = "";
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (text[i + 1] === '"') { field += '"'; i++; }
+          else inQuotes = false;
+        } else {
+          field += c;
+        }
+      } else {
+        if (c === '"') inQuotes = true;
+        else if (c === delim) { cur.push(field); field = ""; }
+        else if (c === "\n") { cur.push(field); field = ""; rows.push(cur); cur = []; }
+        else if (c === "\r") { /* skip */ }
+        else field += c;
+      }
+    }
+    if (field.length || cur.length) { cur.push(field); rows.push(cur); }
+
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "CSV");
+    return wb;
   }
 
   function renderWorkbook(wb, ts) {
