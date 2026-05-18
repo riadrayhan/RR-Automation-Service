@@ -245,11 +245,13 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
       };
       const ct = hdr("content-type");
       const cd = hdr("content-disposition");
+      // Broad URL/CT match — the actual content is verified by detectReportFormat,
+      // which rejects HTML/CSS/XML/JS payloads even if their URL looked download-y.
       const looksXlsx =
         /\.xlsx?(\?|#|$)/i.test(url) ||
         /\.csv(\?|#|$)/i.test(url) ||
-        /excel|export|download/i.test(url) ||
-        /spreadsheet|excel|officedocument|csv|text\/plain|application\/octet-stream/i.test(ct) ||
+        /export|download/i.test(url) ||
+        /spreadsheet|excel|officedocument|text\/csv|application\/csv|application\/octet-stream/i.test(ct) ||
         /\.(xlsx?|csv)/i.test(cd) ||
         /attachment/i.test(cd);
 
@@ -286,10 +288,11 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
       try { await sendCmd(runState.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
 
       if (captured) {
-        // Wind down: detach debugger after a brief delay
-        const tid = runState.tabId;
-        setTimeout(() => detachDebuggerSafe(tid), 500);
-        runState = null;
+        // Wind down: detach debugger after a brief delay.
+        // Do NOT clear runState here — deliverXlsx may have already chained to a new flow
+        // with a fresh runState; clearing would wipe the new flow's state.
+        const tid = runState && runState.tabId === source.tabId ? source.tabId : null;
+        setTimeout(() => detachDebuggerSafe(source.tabId), 500);
       }
     }
   } catch (e) {
@@ -311,19 +314,39 @@ function base64ToArrayBuffer(b64) {
 }
 
 // Detects "xlsx" (ZIP magic) or "csv" (printable text). Returns null otherwise.
+// Explicitly rejects HTML, XML, CSS, JS — these are common false positives because
+// they're also printable text but they are NOT the report.
 function detectReportFormat(buf) {
   if (!buf || buf.byteLength < 2) return null;
   const v = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
   if (v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04) return "xlsx";
-  // Look at up to 512 bytes — if 95%+ are printable text/whitespace, treat as CSV.
-  const sample = new Uint8Array(buf, 0, Math.min(512, buf.byteLength));
+  // Look at up to 1024 bytes for content sniffing.
+  const sniffLen = Math.min(1024, buf.byteLength);
+  const sample = new Uint8Array(buf, 0, sniffLen);
+  // Reject obvious non-CSV text payloads (HTML, XML, CSS @font-face, JS).
+  let head = "";
+  for (let i = 0; i < Math.min(256, sample.length); i++) head += String.fromCharCode(sample[i]);
+  const trimmed = head.replace(/^\uFEFF/, "").trimStart().toLowerCase();
+  if (
+    trimmed.startsWith("<") ||
+    trimmed.startsWith("<!doctype") ||
+    trimmed.startsWith("<html") ||
+    trimmed.startsWith("<?xml") ||
+    trimmed.startsWith("@font-face") ||
+    trimmed.startsWith("@import") ||
+    trimmed.startsWith("@charset") ||
+    trimmed.startsWith("/*") ||
+    /^\s*(function|var|const|let|import|export)\s/.test(trimmed)
+  ) return null;
   let printable = 0;
   for (let i = 0; i < sample.length; i++) {
     const c = sample[i];
     if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126) || c >= 160) printable++;
   }
-  if (printable / sample.length >= 0.92) return "csv";
-  return null;
+  if (printable / sample.length < 0.92) return null;
+  // Reasonable CSV has at least one comma or newline in the first 1KB.
+  if (!/[,\n;\t|]/.test(head)) return null;
+  return "csv";
 }
 
 async function focusOrOpenViewer(flowKey) {

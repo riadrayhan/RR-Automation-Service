@@ -31,14 +31,21 @@
     if (!buf || buf.byteLength < 2) return false;
     const v = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
     if (v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04) return true;
-    // CSV: printable text
-    const sample = new Uint8Array(buf, 0, Math.min(512, buf.byteLength));
+    // CSV: printable text, but reject HTML/CSS/XML/JS payloads.
+    const sniff = new Uint8Array(buf, 0, Math.min(1024, buf.byteLength));
+    let head = "";
+    for (let i = 0; i < Math.min(256, sniff.length); i++) head += String.fromCharCode(sniff[i]);
+    const t = head.replace(/^\uFEFF/, "").trimStart().toLowerCase();
+    if (t.startsWith("<") || t.startsWith("@font-face") || t.startsWith("@import") ||
+        t.startsWith("@charset") || t.startsWith("/*") ||
+        /^\s*(function|var|const|let|import|export)\s/.test(t)) return false;
     let printable = 0;
-    for (let i = 0; i < sample.length; i++) {
-      const c = sample[i];
+    for (let i = 0; i < sniff.length; i++) {
+      const c = sniff[i];
       if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126) || c >= 160) printable++;
     }
-    return printable / sample.length >= 0.92;
+    if (printable / sniff.length < 0.92) return false;
+    return /[,\n;\t|]/.test(head);
   }
 
   function postBytes(buf, sourceUrl) {
