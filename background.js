@@ -289,30 +289,83 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
 
       console.log("[sahaj-auto][fetch] candidate:", url, "status:", status, "ct:", ct, "cd:", cd);
       let captured = false;
+      let buf = null;
+      let alreadyFulfilled = false;
+      // (1) Try Fetch.getResponseBody (works for most text/JSON responses).
       try {
         const body = await sendCmd(source.tabId, "Fetch.getResponseBody", { requestId: reqId });
         if (body && typeof body.body === "string") {
-          let buf;
           if (body.base64Encoded) buf = base64ToArrayBuffer(body.body);
           else buf = new TextEncoder().encode(body.body).buffer;
-
-          const fmt = detectReportFormat(buf);
-          if (fmt && !runState.xlsxDelivered) {
-            runState.xlsxDelivered = true;
-            captured = true;
-            const b64 = arrayBufferToBase64(buf);
-            await deliverXlsx(b64, buf.byteLength, "cdp-fetch", fmt);
-          } else {
-            console.log("[sahaj-auto][fetch] body not a recognized report, byteLen:", buf.byteLength);
-          }
-        } else {
-          console.log("[sahaj-auto][fetch] empty body returned");
         }
       } catch (e) {
         console.warn("[sahaj-auto][fetch] getResponseBody failed:", e && e.message);
       }
-      // ALWAYS continue — even if capture succeeded, otherwise the page hangs.
-      try { await sendDebugCmd(source.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
+      // (2) Fallback for binary downloads where getResponseBody returns empty —
+      // stream the body via Fetch.takeResponseBodyAsStream + IO.read.
+      if (!buf || buf.byteLength === 0) {
+        try {
+          const stream = await sendCmd(source.tabId, "Fetch.takeResponseBodyAsStream", { requestId: reqId });
+          if (stream && stream.stream) {
+            const handle = stream.stream;
+            const chunks = [];
+            let total = 0;
+            while (true) {
+              const r = await sendCmd(source.tabId, "IO.read", { handle, size: 1 << 16 });
+              if (!r || !r.data) break;
+              const part = r.base64Encoded
+                ? new Uint8Array(base64ToArrayBuffer(r.data))
+                : new TextEncoder().encode(r.data);
+              chunks.push(part);
+              total += part.byteLength;
+              if (r.eof) break;
+            }
+            try { await sendCmd(source.tabId, "IO.close", { handle }); } catch (_) {}
+            if (total > 0) {
+              const merged = new Uint8Array(total);
+              let off = 0;
+              for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
+              buf = merged.buffer;
+              console.log("[sahaj-auto][fetch] streamed body via IO.read, bytes=", total);
+              // NOTE: taking the stream consumes the response. We must fulfillRequest
+              // to deliver something back to the page; otherwise the browser may stall.
+              try {
+                const b64Body = arrayBufferToBase64(buf);
+                await sendCmd(source.tabId, "Fetch.fulfillRequest", {
+                  requestId: reqId,
+                  responseCode: status || 200,
+                  responseHeaders: headers,
+                  body: b64Body
+                });
+                alreadyFulfilled = true;
+              } catch (e) {
+                console.warn("[sahaj-auto][fetch] fulfillRequest after stream failed:", e && e.message);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("[sahaj-auto][fetch] takeResponseBodyAsStream failed:", e && e.message);
+        }
+      }
+
+      if (buf && buf.byteLength) {
+        const fmt = detectReportFormat(buf);
+        if (fmt && !runState.xlsxDelivered) {
+          runState.xlsxDelivered = true;
+          captured = true;
+          const b64 = arrayBufferToBase64(buf);
+          await deliverXlsx(b64, buf.byteLength, "cdp-fetch", fmt);
+        } else {
+          console.log("[sahaj-auto][fetch] body not a recognized report, byteLen:", buf.byteLength);
+        }
+      } else {
+        console.log("[sahaj-auto][fetch] no body could be read");
+      }
+
+      // Continue only if we didn't already fulfill via the streaming path.
+      if (!alreadyFulfilled) {
+        try { await sendDebugCmd(source.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
+      }
 
       if (captured) {
         // Wind down: detach debugger from the captured tab after a brief delay.
@@ -533,12 +586,13 @@ chrome.downloads.onCreated.addListener(async (item) => {
                    (item.url && /excel|export|download/i.test(item.url));
   if (!isReport) { await appendLog("download did not match report heuristics", "info"); return; }
 
-  // If we already have the bytes in storage, this is a duplicate browser download — cancel & erase.
+  // If bytes already captured (via CDP/hook/refetch), just record the download
+  // for tracking — but DO NOT cancel: the user wants the actual file on disk.
   const { lastXlsxB64 } = await chrome.storage.local.get("lastXlsxB64");
   if (lastXlsxB64 || runState.xlsxDelivered) {
-    await appendLog("Duplicate xlsx download (id=" + item.id + ") — cancelling browser save", "info");
-    try { await chrome.downloads.cancel(item.id); } catch (_) {}
-    try { await chrome.downloads.erase({ id: item.id }); } catch (_) {}
+    runState.downloadId = item.id;
+    downloadIdToFlow.set(item.id, runState.flowKey);
+    await appendLog("Browser download running alongside captured bytes (id=" + item.id + ") — letting it save");
     return;
   }
 
