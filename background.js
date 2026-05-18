@@ -54,17 +54,9 @@ chrome.action.onClicked.addListener(async () => {
 
 // State for an in-flight automation run
 let runState = null;
-
-// downloadId -> flowKey  (so onChanged can know which flow a completing download belongs to,
-// and reject downloads that are stale relative to the current flow).
-const downloadFlow = new Map();
-
-// Only null runState if it still belongs to the given flow. Prevents stale
-// post-deliverXlsx cleanups from wiping a chained next-flow's runState.
-function clearRunStateIfFlow(flowKey) {
-  if (!flowKey) { runState = null; return; }
-  if (runState && runState.flowKey === flowKey) runState = null;
-}
+// Maps chrome.downloads id -> the flowKey it was created for. Lets us reject
+// stale onChanged events from a previous flow's download once we've chained.
+const downloadIdToFlow = new Map();
 
 function setBadge(text, color = "#00c0ef") {
   chrome.action.setBadgeBackgroundColor({ color });
@@ -140,7 +132,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } else if (msg.type === "XLSX_BYTES") {
         // Bytes captured by the content/page hook (preferred path). Dedupe by size+ts.
         try {
-          if (runState && runState.xlsxDelivered) {
+          // Reject messages whose sender tab doesn't match the active flow's tab —
+          // otherwise stale bytes from the previous flow's tab can overwrite the
+          // new flow's viewer.
+          if (!runState || (sender && sender.tab && sender.tab.id !== runState.tabId)) {
+            await appendLog("Ignored XLSX_BYTES from non-active tab " +
+              (sender && sender.tab && sender.tab.id), "info");
+            sendResponse({ ok: true, stale: true });
+            return;
+          }
+          if (runState.xlsxDelivered) {
             await appendLog("Ignored duplicate XLSX_BYTES (size=" + msg.size + ")", "info");
             sendResponse({ ok: true, duplicate: true });
             return;
@@ -151,13 +152,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             sendResponse({ ok: true, duplicate: true });
             return;
           }
-          if (runState) runState.xlsxDelivered = true;
+          runState.xlsxDelivered = true;
           const buf = base64ToArrayBuffer(msg.b64);
           const fmt = detectReportFormat(buf) || "xlsx";
-          const flowKeyForCleanup = runState && runState.flowKey;
+          // Do NOT null runState after deliverXlsx — chaining may have already
+          // set up the next flow's runState; clearing here would clobber it.
           await deliverXlsx(msg.b64, msg.size, "page-hook", fmt);
-          // Only clear if no chain replaced runState.
-          clearRunStateIfFlow(flowKeyForCleanup);
         } catch (e) {
           await setStatus("Failed to store xlsx: " + e.message, "error");
         }
@@ -516,9 +516,7 @@ chrome.downloads.onCreated.addListener(async (item) => {
 
   runState.downloadId = item.id;
   runState.downloadUrl = item.url;
-  // Remember which flow this download belongs to so onChanged can reject
-  // stale completions (e.g. flow-1 download finishing AFTER chain moved on).
-  downloadFlow.set(item.id, runState.flowKey);
+  downloadIdToFlow.set(item.id, runState.flowKey);
   await appendLog("xlsx download detected (id=" + item.id + ", flow=" + runState.flowKey + ")");
 
   // Refetch URL from page context (has session cookies).
@@ -572,61 +570,71 @@ chrome.downloads.onChanged.addListener(async (delta) => {
   if (delta.state && delta.state.current) {
     await appendLog("download.onChanged state=" + delta.state.current + " id=" + delta.id);
   }
-  // Allow this to run even if runState was cleared (so the disk read is a true fallback).
-  if (delta.state && delta.state.current === "complete") {
-    // Reject if this download belongs to a flow that's no longer active —
-    // happens when the previous flow's download finishes after chain moved on.
-    const downloadFlowKey = downloadFlow.get(delta.id);
-    const currentFlowKey = runState && runState.flowKey;
-    if (downloadFlowKey && currentFlowKey && downloadFlowKey !== currentFlowKey) {
+  if (!(delta.state && delta.state.current === "complete")) {
+    if (delta.error) {
+      setBadge("ERR", "#dc3545");
+      await setStatus("Download error: " + (delta.error.current || "unknown"), "error");
+    }
+    return;
+  }
+
+  // Identify which flow this download belongs to. Reject anything that isn't
+  // the active flow's download — otherwise a late completion from the previous
+  // flow would overwrite the current flow's viewer with stale bytes.
+  const ownerFlow = downloadIdToFlow.get(delta.id);
+  if (!ownerFlow) {
+    await appendLog("onChanged: download id=" + delta.id + " has no tracked flow — ignoring", "info");
+    return;
+  }
+  if (!runState || runState.flowKey !== ownerFlow) {
+    await appendLog("onChanged: stale download id=" + delta.id + " (flow=" + ownerFlow +
+      ") doesn't match active flow=" + (runState && runState.flowKey) + " — ignoring", "info");
+    downloadIdToFlow.delete(delta.id);
+    return;
+  }
+
+  // Give CDP / page-hook / refetch paths a brief grace period to deliver bytes
+  // before we fall back to reading from disk.
+  await sleep(1200);
+  // Re-check active flow after the sleep (chaining may have advanced).
+  if (!runState || runState.flowKey !== ownerFlow) {
+    await appendLog("onChanged: flow advanced during grace period — ignoring id=" + delta.id, "info");
+    downloadIdToFlow.delete(delta.id);
+    return;
+  }
+  if (runState.xlsxDelivered) {
+    await appendLog("onChanged: bytes already delivered for flow=" + ownerFlow + " — disk read skipped");
+    downloadIdToFlow.delete(delta.id);
+    return;
+  }
+  try {
+    await setStatus("Download complete. Reading file from disk…", "info", 85);
+    const buf = await readDownloadedFile(delta.id);
+    if (!buf) {
       await appendLog(
-        "Ignoring stale download id=" + delta.id +
-        " (belongs to '" + downloadFlowKey + "', current flow is '" + currentFlowKey + "')",
+        "Disk read failed. If no viewer opened, enable 'Allow access to file URLs' on this extension.",
         "info"
       );
-      downloadFlow.delete(delta.id);
+      downloadIdToFlow.delete(delta.id);
       return;
     }
-    // Capture the flow this download belongs to BEFORE awaiting anything,
-    // so we can scope cleanups to it (and not wipe a chained flow's runState).
-    const flowKeyAtStart = currentFlowKey;
-    // Give the CDP / page-hook / refetch paths a brief grace period to deliver bytes
-    // before we fall back to reading from disk (which needs the file-URL toggle).
-    await sleep(1200);
-    const cur = await chrome.storage.local.get("lastXlsxB64");
-    if (cur.lastXlsxB64) {
-      await appendLog("Storage already has report bytes — disk read skipped");
-      clearRunStateIfFlow(flowKeyAtStart);
+    // Final guard before writing: confirm we're still on the same flow.
+    if (!runState || runState.flowKey !== ownerFlow) {
+      await appendLog("onChanged: flow advanced during disk read — dropping bytes for id=" + delta.id, "info");
+      downloadIdToFlow.delete(delta.id);
       return;
     }
-    try {
-      await setStatus("Download complete. Reading file from disk…", "info", 85);
-      const buf = await readDownloadedFile(delta.id);
-      if (!buf) {
-        // Silently bail; do NOT auto-open chrome://extensions (annoying & racey).
-        await appendLog(
-          "Disk read failed. If no viewer opened, enable 'Allow access to file URLs' on this extension.",
-          "info"
-        );
-        clearRunStateIfFlow(flowKeyAtStart);
-        return;
-      }
-      const b64 = arrayBufferToBase64(buf);
-      await appendLog("Disk read OK — " + buf.byteLength + " bytes");
-      const fmt = detectReportFormat(buf) || "xlsx";
-      await deliverXlsx(b64, buf.byteLength, "disk", fmt);
-    } catch (e) {
-      console.error(e);
-      setBadge("ERR", "#dc3545");
-      await setStatus(e.message, "error");
-    } finally {
-      downloadFlow.delete(delta.id);
-      clearRunStateIfFlow(flowKeyAtStart);
-    }
-  } else if (delta.error) {
+    const b64 = arrayBufferToBase64(buf);
+    await appendLog("Disk read OK — " + buf.byteLength + " bytes");
+    const fmt = detectReportFormat(buf) || "xlsx";
+    runState.xlsxDelivered = true;
+    await deliverXlsx(b64, buf.byteLength, "disk", fmt);
+  } catch (e) {
+    console.error(e);
     setBadge("ERR", "#dc3545");
-    await setStatus("Download error: " + (delta.error.current || "unknown"), "error");
-    // Don't aggressively clear runState on error — chained flow may already be running.
+    await setStatus(e.message, "error");
+  } finally {
+    downloadIdToFlow.delete(delta.id);
   }
 });
 
