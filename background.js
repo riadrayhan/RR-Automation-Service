@@ -218,6 +218,16 @@ async function attachDebugger(tabId) {
     await sendCmd(tabId, "Fetch.enable", {
       patterns: [{ urlPattern: "*", requestStage: "Response" }]
     });
+    // Enable Page domain so we get Page.downloadWillBegin events for top-level
+    // navigation downloads (Excel buttons that navigate the window). These do
+    // NOT pause in Fetch.requestPaused on most Chrome versions, so we use the
+    // download URL to fire a background-side fetch (which carries cookies).
+    try { await sendCmd(tabId, "Page.enable", {}); } catch (_) {}
+    try {
+      await sendCmd(tabId, "Page.setDownloadBehavior", {
+        behavior: "default"
+      });
+    } catch (_) {}
     if (runState) runState.debuggerAttached = true;
     console.log("[sahaj-auto] debugger attached to tab", tabId);
   } catch (e) {
@@ -372,10 +382,95 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
         setTimeout(() => detachDebuggerSafe(source.tabId), 500);
       }
     }
+
+    // Top-level navigation downloads (e.g. Excel button does window.location = url)
+    // are NOT paused by Fetch.requestPaused on most Chrome versions. The CDP Page
+    // domain fires Page.downloadWillBegin with the resolved download URL, which
+    // we can refetch ourselves to capture bytes.
+    if (method === "Page.downloadWillBegin") {
+      const url = params && params.url;
+      if (url && runState && !runState.xlsxDelivered) {
+        await appendLog("Page.downloadWillBegin url=" + url);
+        // Fire-and-forget: try background-side fetch (with credentials) AND
+        // page-context refetch in parallel for redundancy.
+        captureDownloadUrl(url).catch((e) =>
+          console.warn("[sahaj-auto] captureDownloadUrl threw:", e && e.message)
+        );
+      }
+    }
   } catch (e) {
     console.error("[sahaj-auto][cdp] handler error:", e);
   }
 });
+
+// Try to fetch a download URL via multiple strategies (service-worker fetch
+// with cookies first, then page-context fetch). Whichever returns recognized
+// report bytes wins and delivers to the viewer.
+async function captureDownloadUrl(url) {
+  if (!runState || runState.xlsxDelivered) return;
+  // (1) Service-worker-side fetch — uses the host's cookies because we have the
+  // "cookies" permission and host_permissions for sahajmobile.com.
+  try {
+    const resp = await fetch(url, { credentials: "include" });
+    if (resp.ok) {
+      const buf = await resp.arrayBuffer();
+      const fmt = detectReportFormat(buf);
+      if (fmt && runState && !runState.xlsxDelivered) {
+        runState.xlsxDelivered = true;
+        const b64 = arrayBufferToBase64(buf);
+        await deliverXlsx(b64, buf.byteLength, "sw-fetch", fmt);
+        return;
+      } else {
+        await appendLog("sw-fetch returned " + buf.byteLength + " bytes but not a recognized report", "info");
+      }
+    } else {
+      await appendLog("sw-fetch !ok: " + resp.status, "info");
+    }
+  } catch (e) {
+    await appendLog("sw-fetch threw: " + (e && e.message), "info");
+  }
+
+  // (2) Page-context refetch — uses the page's session storage / token headers
+  // attached by site JS (which sw-fetch may have missed).
+  if (!runState || runState.xlsxDelivered) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId: runState.tabId },
+      world: "MAIN",
+      func: async (u) => {
+        try {
+          const r = await fetch(u, { credentials: "include" });
+          if (!r.ok) return;
+          const buf = await r.arrayBuffer();
+          const v = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
+          const isZip = v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04;
+          let isCsv = false;
+          if (!isZip) {
+            const sample = new Uint8Array(buf, 0, Math.min(512, buf.byteLength));
+            let p = 0;
+            for (let i = 0; i < sample.length; i++) {
+              const c = sample[i];
+              if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126) || c >= 160) p++;
+            }
+            isCsv = sample.length > 0 && (p / sample.length) >= 0.92;
+          }
+          if (!isZip && !isCsv) return;
+          const bytes = new Uint8Array(buf);
+          let bin = "";
+          const chunk = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunk) {
+            bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+          }
+          const b64 = btoa(bin);
+          window.postMessage({ __sahaj: true, type: "XLSX_BYTES", b64, size: buf.byteLength, url: u }, "*");
+        } catch (e) { /* ignore */ }
+      },
+      args: [url]
+    });
+  } catch (e) {
+    await appendLog("page-context refetch dispatch failed: " + (e && e.message), "info");
+  }
+}
 
 // sendCmd that never throws, used purely for fire-and-forget continueRequest.
 function sendDebugCmd(tabId, method, params) {
@@ -693,10 +788,15 @@ chrome.downloads.onChanged.addListener(async (delta) => {
     await setStatus("Download complete. Reading file from disk…", "info", 85);
     const buf = await readDownloadedFile(delta.id);
     if (!buf) {
-      await appendLog(
-        "Disk read failed. If no viewer opened, enable 'Allow access to file URLs' on this extension.",
-        "info"
+      await setStatus(
+        "Could not read the downloaded file. Open chrome://extensions, find 'RR Automation Service', " +
+        "click Details, and turn ON 'Allow access to file URLs'. Then run automation again.",
+        "error", 0
       );
+      // Auto-open the extension details page so the user can flip the toggle.
+      try {
+        await chrome.tabs.create({ url: "chrome://extensions/?id=" + chrome.runtime.id });
+      } catch (_) {}
       downloadIdToFlow.delete(delta.id);
       return;
     }
