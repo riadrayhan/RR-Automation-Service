@@ -232,7 +232,20 @@ async function detachDebuggerSafe(tabId) {
 }
 
 chrome.debugger.onEvent.addListener(async (source, method, params) => {
-  if (!runState || source.tabId !== runState.tabId) return;
+  // CRITICAL: Fetch.requestPaused MUST always be continued, otherwise the page hangs.
+  // Handle that case before any early-return checks.
+  if (method === "Fetch.requestPaused") {
+    const reqId = params && params.requestId;
+    // If this event isn't for our active flow's tab, just continue it and bail.
+    if (!runState || source.tabId !== runState.tabId) {
+      try { await sendDebugCmd(source.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
+      return;
+    }
+  } else {
+    // Non-Fetch events: keep the old guard.
+    if (!runState || source.tabId !== runState.tabId) return;
+  }
+
   try {
     if (method === "Fetch.requestPaused") {
       const reqId = params.requestId;
@@ -257,14 +270,14 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
 
       if (!looksXlsx) {
         // Pass through without inspection
-        try { await sendCmd(runState.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
+        try { await sendDebugCmd(source.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
         return;
       }
 
       console.log("[sahaj-auto][fetch] candidate:", url, "status:", status, "ct:", ct, "cd:", cd);
       let captured = false;
       try {
-        const body = await sendCmd(runState.tabId, "Fetch.getResponseBody", { requestId: reqId });
+        const body = await sendCmd(source.tabId, "Fetch.getResponseBody", { requestId: reqId });
         if (body && typeof body.body === "string") {
           let buf;
           if (body.base64Encoded) buf = base64ToArrayBuffer(body.body);
@@ -285,13 +298,11 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
       } catch (e) {
         console.warn("[sahaj-auto][fetch] getResponseBody failed:", e && e.message);
       }
-      try { await sendCmd(runState.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
+      // ALWAYS continue — even if capture succeeded, otherwise the page hangs.
+      try { await sendDebugCmd(source.tabId, "Fetch.continueRequest", { requestId: reqId }); } catch (_) {}
 
       if (captured) {
-        // Wind down: detach debugger after a brief delay.
-        // Do NOT clear runState here — deliverXlsx may have already chained to a new flow
-        // with a fresh runState; clearing would wipe the new flow's state.
-        const tid = runState && runState.tabId === source.tabId ? source.tabId : null;
+        // Wind down: detach debugger from the captured tab after a brief delay.
         setTimeout(() => detachDebuggerSafe(source.tabId), 500);
       }
     }
@@ -299,6 +310,16 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
     console.error("[sahaj-auto][cdp] handler error:", e);
   }
 });
+
+// sendCmd that never throws, used purely for fire-and-forget continueRequest.
+function sendDebugCmd(tabId, method, params) {
+  return new Promise((resolve) => {
+    chrome.debugger.sendCommand({ tabId }, method, params, () => {
+      void chrome.runtime.lastError;
+      resolve();
+    });
+  });
+}
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   console.log("[sahaj-auto] debugger detached:", source, "reason:", reason);
