@@ -21,7 +21,7 @@
         const ok = await tryLogin(msg.creds);
         sendResponse({ ok });
       } else if (msg.type === "CLICK_EXCEL") {
-        const ok = await clickExcel();
+        const ok = await clickExcel(msg.buttonHints, msg.waitForData !== false);
         sendResponse({ ok });
       }
     })();
@@ -140,9 +140,15 @@
     return lastCount > 0; // proceed anyway if we ever saw rows
   }
 
-  async function clickExcel() {
-    await waitForDataLoaded(30000);
-    const btn = await waitFor(() => findExcelButton(), 20000);
+  async function clickExcel(buttonHints, waitForData) {
+    if (waitForData !== false) {
+      await waitForDataLoaded(30000);
+    } else {
+      chrome.runtime.sendMessage({ type: "LOG_DEBUG", text: "Skipping data-table wait (waitForData=false)" });
+      // Still give the page a moment to render the button itself.
+      await sleep(1500);
+    }
+    const btn = await waitFor(() => findExcelButton(buttonHints), 20000);
     if (!btn) {
       console.warn("[sahaj-auto] Excel button not found");
       chrome.runtime.sendMessage({ type: "LOG_DEBUG", text: "Excel button not found in DOM after 20s", kind: "error" });
@@ -205,9 +211,17 @@
   }
 
   function looksLikeXlsx(buf) {
-    // .xlsx is a ZIP — starts with PK\x03\x04
-    const v = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
-    return v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04;
+    // Accept .xlsx (ZIP) OR .csv (printable text). Returns true for either.
+    if (!buf || buf.byteLength < 2) return false;
+    const v = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
+    if (v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04) return true;
+    const sample = new Uint8Array(buf, 0, Math.min(512, buf.byteLength));
+    let printable = 0;
+    for (let i = 0; i < sample.length; i++) {
+      const c = sample[i];
+      if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126) || c >= 160) printable++;
+    }
+    return printable / sample.length >= 0.92;
   }
 
   function arrayBufferToBase64(buffer) {
@@ -220,27 +234,32 @@
     return btoa(binary);
   }
 
-  function findExcelButton() {
+  function findExcelButton(hints) {
+    const list = (hints && hints.length) ? hints : ["Excel"];
     const candidates = $$("button, a, input[type='button'], input[type='submit'], span[role='button'], div[role='button']");
     const desc = (el) => [
       el.innerText, el.textContent, el.value, el.getAttribute("title"),
       el.getAttribute("aria-label"), el.getAttribute("data-original-title")
     ].filter(Boolean).join(" ").trim();
 
-    // 1. Exact "Excel" text + btn-info styling
-    let hit = candidates.find((el) =>
-      /^\s*excel\s*$/i.test(desc(el)) && el.classList.contains("btn-info"));
-    if (hit) return hit;
-    // 2. Exact "Excel" text
-    hit = candidates.find((el) => /^\s*excel\s*$/i.test(desc(el)));
-    if (hit) return hit;
-    // 3. Contains "Excel" + btn class
-    hit = candidates.find((el) =>
-      /excel/i.test(desc(el)) && (el.classList.contains("btn-info") || el.classList.contains("btn")));
-    if (hit) return hit;
-    // 4. Any element containing "Excel"
-    hit = candidates.find((el) => /excel/i.test(desc(el)));
-    return hit || null;
+    const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    for (const hint of list) {
+      const exact = new RegExp("^\\s*" + escRe(hint) + "\\s*$", "i");
+      const contains = new RegExp(escRe(hint), "i");
+      // 1. Exact text + btn class
+      let hit = candidates.find((el) => exact.test(desc(el)) && el.classList.contains("btn"));
+      if (hit) return hit;
+      // 2. Exact text
+      hit = candidates.find((el) => exact.test(desc(el)));
+      if (hit) return hit;
+      // 3. Contains text + btn class
+      hit = candidates.find((el) => contains.test(desc(el)) && el.classList.contains("btn"));
+      if (hit) return hit;
+      // 4. Any element containing text
+      hit = candidates.find((el) => contains.test(desc(el)));
+      if (hit) return hit;
+    }
+    return null;
   }
 
   function text(el) {

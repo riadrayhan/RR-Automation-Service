@@ -6,6 +6,22 @@ try { importScripts("config.js"); } catch (e) { console.warn("config.js not load
 
 const TARGET_URL = "https://sahajmobile.com/customers/todayservicing";
 
+// Supported automation flows. The popup picks one via {flow: "<key>"}.
+const FLOWS = {
+  todayservicing: {
+    url: "https://sahajmobile.com/customers/todayservicing",
+    buttonHints: ["Excel"],
+    title: "Today Servicing",
+    waitForData: true
+  },
+  online_payment_report: {
+    url: "https://sahajmobile.com/reports/online_payment_report",
+    buttonHints: ["Download All"],
+    title: "Online Payment Report",
+    waitForData: false
+  }
+};
+
 // On install / startup, mirror config.js into chrome.storage.local so the rest of the code
 // can keep using a single source of truth.
 async function syncConfigToStorage() {
@@ -89,7 +105,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: "Credentials not set. Open Options first." });
           return;
         }
-        await startAutomation(creds);
+        const flowKey = msg.flow || "online_payment_report";
+        // After online_payment_report completes, automatically run todayservicing.
+        const chainNext = flowKey === "online_payment_report" ? "todayservicing" : null;
+        await startAutomation(creds, flowKey, chainNext);
         sendResponse({ ok: true });
       } else if (msg.type === "CONTENT_READY") {
         // content script announcing page load
@@ -122,7 +141,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             return;
           }
           if (runState) runState.xlsxDelivered = true;
-          await deliverXlsx(msg.b64, msg.size, "page-hook");
+          const buf = base64ToArrayBuffer(msg.b64);
+          const fmt = detectReportFormat(buf) || "xlsx";
+          await deliverXlsx(msg.b64, msg.size, "page-hook", fmt);
           runState = null;
         } catch (e) {
           await setStatus("Failed to store xlsx: " + e.message, "error");
@@ -137,22 +158,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true; // async response
 });
 
-async function startAutomation(creds) {
+async function startAutomation(creds, flowKey, chainNext) {
+  flowKey = flowKey || "todayservicing";
+  const flow = FLOWS[flowKey] || FLOWS.todayservicing;
   setBadge("…");
-  // Clear any stale capture from a previous run so dedup doesn't reject new bytes.
-  try { await chrome.storage.local.remove(["lastXlsxB64", "lastXlsxSize", "lastXlsxTs"]); } catch (_) {}
-  await setStatus("Opening target page…", "info", 5);
-  // Go straight to the target page. If not authenticated, the site will redirect to its login page.
-  const tab = await chrome.tabs.create({ url: TARGET_URL, active: true });
+  // Clear stale legacy capture so dedup doesn't reject new bytes for this flow.
+  try { await chrome.storage.local.remove(["lastXlsxB64", "lastXlsxSize", "lastXlsxTs", "lastXlsxFormat"]); } catch (_) {}
+  // Clear stale per-flow capture so the viewer doesn't render the previous run's bytes.
+  try {
+    await chrome.storage.local.remove([
+      `xlsx_${flowKey}`, `xlsxSize_${flowKey}`, `xlsxTs_${flowKey}`, `xlsxFormat_${flowKey}`
+    ]);
+  } catch (_) {}
+  await chrome.storage.local.set({ flowTitle: flow.title });
+  await setStatus("Opening " + flow.title + "…", "info", 5);
+  const tab = await chrome.tabs.create({ url: flow.url, active: true });
   runState = {
     tabId: tab.id,
     creds,
+    flow,
+    flowKey,
+    chainNext: chainNext || null,
     stage: "navigating",
     excelClicked: false,
     loginAttempted: false,
     downloadId: null,
     debuggerAttached: false,
-    pendingResponses: new Map() // requestId -> { url, mime }
+    pendingResponses: new Map()
   };
   await attachDebugger(tab.id);
 }
@@ -215,9 +247,10 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
       const cd = hdr("content-disposition");
       const looksXlsx =
         /\.xlsx?(\?|#|$)/i.test(url) ||
-        /excel|export/i.test(url) ||
-        /spreadsheet|excel|officedocument|application\/octet-stream/i.test(ct) ||
-        /\.xlsx?/i.test(cd) ||
+        /\.csv(\?|#|$)/i.test(url) ||
+        /excel|export|download/i.test(url) ||
+        /spreadsheet|excel|officedocument|csv|text\/plain|application\/octet-stream/i.test(ct) ||
+        /\.(xlsx?|csv)/i.test(cd) ||
         /attachment/i.test(cd);
 
       if (!looksXlsx) {
@@ -235,15 +268,14 @@ chrome.debugger.onEvent.addListener(async (source, method, params) => {
           if (body.base64Encoded) buf = base64ToArrayBuffer(body.body);
           else buf = new TextEncoder().encode(body.body).buffer;
 
-          const v = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
-          const isZip = v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04;
-          if (isZip && !runState.xlsxDelivered) {
+          const fmt = detectReportFormat(buf);
+          if (fmt && !runState.xlsxDelivered) {
             runState.xlsxDelivered = true;
             captured = true;
             const b64 = arrayBufferToBase64(buf);
-            await deliverXlsx(b64, buf.byteLength, "cdp-fetch");
+            await deliverXlsx(b64, buf.byteLength, "cdp-fetch", fmt);
           } else {
-            console.log("[sahaj-auto][fetch] body not xlsx-zip, byteLen:", buf.byteLength);
+            console.log("[sahaj-auto][fetch] body not a recognized report, byteLen:", buf.byteLength);
           }
         } else {
           console.log("[sahaj-auto][fetch] empty body returned");
@@ -278,9 +310,25 @@ function base64ToArrayBuffer(b64) {
   return bytes.buffer;
 }
 
-async function focusOrOpenViewer() {
-  // Always open a fresh viewer tab on successful capture.
-  const url = chrome.runtime.getURL("viewer.html");
+// Detects "xlsx" (ZIP magic) or "csv" (printable text). Returns null otherwise.
+function detectReportFormat(buf) {
+  if (!buf || buf.byteLength < 2) return null;
+  const v = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
+  if (v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04) return "xlsx";
+  // Look at up to 512 bytes — if 95%+ are printable text/whitespace, treat as CSV.
+  const sample = new Uint8Array(buf, 0, Math.min(512, buf.byteLength));
+  let printable = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const c = sample[i];
+    if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126) || c >= 160) printable++;
+  }
+  if (printable / sample.length >= 0.92) return "csv";
+  return null;
+}
+
+async function focusOrOpenViewer(flowKey) {
+  // Always open a fresh viewer tab on successful capture; the flow key is on the URL hash.
+  const url = chrome.runtime.getURL("viewer.html") + (flowKey ? "#" + flowKey : "");
   const t = await chrome.tabs.create({ url, active: true });
   try { await chrome.windows.update(t.windowId, { focused: true }); } catch (_) {}
   return t.id;
@@ -289,25 +337,48 @@ async function focusOrOpenViewer() {
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /**
- * Deliver captured xlsx bytes to a fresh viewer tab with a visible staged
- * progress animation: open tab → 40% → 60% → store bytes (triggers render) → 100%.
+ * Deliver captured xlsx bytes to a fresh viewer tab. Each flow gets its own
+ * storage key (xlsx_<flowKey>) so multiple flows can be displayed independently.
  */
-async function deliverXlsx(b64, size, sourceLabel) {
-  // 1. Announce capture and open a fresh viewer tab immediately.
-  await setStatus("Download captured (" + size + " bytes). Opening viewer…", "info", 30);
-  await focusOrOpenViewer();
-  // 2. Give the viewer ~400ms to mount and subscribe to storage events.
+async function deliverXlsx(b64, size, sourceLabel, format) {
+  format = format || "xlsx";
+  const flowKey = runState && runState.flow ? runState.flowKey : "todayservicing";
+  const flowTitle = runState && runState.flow ? runState.flow.title : "Result";
+  await setStatus("Download captured (" + size + " bytes, " + format + "). Opening viewer…", "info", 30);
+  await focusOrOpenViewer(flowKey);
   await sleep(400);
   await setStatus("Preparing data…", "info", 50);
   await sleep(250);
-  await setStatus("Parsing workbook…", "info", 70);
+  await setStatus("Parsing " + format.toUpperCase() + "…", "info", 70);
   await sleep(200);
-  // 3. Store the bytes — viewer's storage.onChanged listener will render now.
-  await chrome.storage.local.set({ lastXlsxB64: b64, lastXlsxSize: size, lastXlsxTs: Date.now() });
+  const payload = {
+    [`xlsx_${flowKey}`]: b64,
+    [`xlsxSize_${flowKey}`]: size,
+    [`xlsxTs_${flowKey}`]: Date.now(),
+    [`xlsxFormat_${flowKey}`]: format,
+    [`flowTitle_${flowKey}`]: flowTitle,
+    lastXlsxB64: b64,
+    lastXlsxSize: size,
+    lastXlsxTs: Date.now(),
+    lastXlsxFormat: format,
+    flowTitle
+  };
+  await chrome.storage.local.set(payload);
   await setStatus("Rendering data…", "info", 90);
   await sleep(150);
   setBadge("OK", "#28a745");
-  await setStatus("Done. Data displayed in viewer.", "ok", 100);
+  await setStatus(flowTitle + " ready.", "ok", 100);
+
+  // Chain: after this flow succeeds, automatically run the next one.
+  if (runState && runState.chainNext) {
+    const nextFlowKey = runState.chainNext;
+    const nextFlow = FLOWS[nextFlowKey];
+    runState = null;
+    await sleep(800);
+    await appendLog("Chaining to next flow: " + nextFlowKey);
+    const creds = await getCreds();
+    if (creds && nextFlow) await startAutomation(creds, nextFlowKey, null);
+  }
 }
 
 // Drive the flow off tab navigation events — more reliable than relying on content script timing.
@@ -321,18 +392,22 @@ async function handlePageReady(url, tabId) {
   if (!runState || tabId !== runState.tabId) return;
   console.log("[sahaj-auto] page ready:", url, "stage:", runState.stage);
 
-  // On target page → click Excel (once).
-  if (url.startsWith(TARGET_URL)) {
+  // On target page → click flow button (once).
+  const flowUrl = runState.flow ? runState.flow.url : TARGET_URL;
+  if (url.startsWith(flowUrl)) {
     if (runState.excelClicked) return;
     runState.excelClicked = true;
     runState.stage = "clicking-excel";
     await setStatus("On target page. Waiting for data to load…", "info", 55);
-    // small delay to let the page render fully
     setTimeout(async () => {
       try {
-        const res = await chrome.tabs.sendMessage(tabId, { type: "CLICK_EXCEL" });
-        if (res?.ok) await setStatus("Excel button clicked. Waiting for download…", "info", 75);
-        else await setStatus("Excel button NOT found on page.", "error");
+        const res = await chrome.tabs.sendMessage(tabId, {
+          type: "CLICK_EXCEL",
+          buttonHints: runState.flow ? runState.flow.buttonHints : ["Excel"],
+          waitForData: runState.flow ? runState.flow.waitForData !== false : true
+        });
+        if (res?.ok) await setStatus("Button clicked. Waiting for download…", "info", 75);
+        else await setStatus("Export button NOT found on page.", "error");
       } catch (e) {
         await setStatus("Could not message content script: " + e.message, "error");
       }
@@ -359,7 +434,7 @@ async function handlePageReady(url, tabId) {
   if (runState.stage !== "forcing-target") {
     runState.stage = "forcing-target";
     await setStatus("Logged in. Navigating to target page…", "info", 50);
-    chrome.tabs.update(tabId, { url: TARGET_URL });
+    chrome.tabs.update(tabId, { url: runState.flow ? runState.flow.url : TARGET_URL });
   }
 }
 
@@ -367,11 +442,11 @@ async function handlePageReady(url, tabId) {
 chrome.downloads.onCreated.addListener(async (item) => {
   await appendLog("download.onCreated: url=" + item.url + " mime=" + item.mime + " fn=" + item.filename);
   if (!runState) { await appendLog("(no runState — ignoring)", "info"); return; }
-  const isXlsx = (item.filename && /\.xlsx?$/i.test(item.filename)) ||
-                 (item.mime && /spreadsheet|excel/i.test(item.mime)) ||
-                 (item.url && /\.xlsx?(\?|$)/i.test(item.url)) ||
-                 (item.url && /excel|export/i.test(item.url));
-  if (!isXlsx) { await appendLog("download did not match xlsx heuristics", "info"); return; }
+  const isReport = (item.filename && /\.(xlsx?|csv)$/i.test(item.filename)) ||
+                   (item.mime && /spreadsheet|excel|csv|text\/plain/i.test(item.mime)) ||
+                   (item.url && /\.(xlsx?|csv)(\?|$)/i.test(item.url)) ||
+                   (item.url && /excel|export|download/i.test(item.url));
+  if (!isReport) { await appendLog("download did not match report heuristics", "info"); return; }
 
   // If we already have the bytes in storage, this is a duplicate browser download — cancel & erase.
   const { lastXlsxB64 } = await chrome.storage.local.get("lastXlsxB64");
@@ -397,9 +472,21 @@ chrome.downloads.onCreated.addListener(async (item) => {
             const r = await fetch(url, { credentials: "include" });
             if (!r.ok) { console.warn("[sahaj-refetch] !ok", r.status); return; }
             const buf = await r.arrayBuffer();
-            const v = new Uint8Array(buf, 0, 4);
-            if (!(v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04)) {
-              console.warn("[sahaj-refetch] not zip");
+            const v = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
+            const isZip = v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04;
+            // CSV check: ≥92% printable in first 512 bytes.
+            let isCsv = false;
+            if (!isZip) {
+              const sample = new Uint8Array(buf, 0, Math.min(512, buf.byteLength));
+              let p = 0;
+              for (let i = 0; i < sample.length; i++) {
+                const c = sample[i];
+                if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126) || c >= 160) p++;
+              }
+              isCsv = sample.length > 0 && (p / sample.length) >= 0.92;
+            }
+            if (!isZip && !isCsv) {
+              console.warn("[sahaj-refetch] not xlsx/csv");
               return;
             }
             const bytes = new Uint8Array(buf);
@@ -427,10 +514,12 @@ chrome.downloads.onChanged.addListener(async (delta) => {
   }
   // Allow this to run even if runState was cleared (so the disk read is a true fallback).
   if (delta.state && delta.state.current === "complete") {
-    // If bytes already delivered (via hook/CDP/refetch), skip.
+    // Give the CDP / page-hook / refetch paths a brief grace period to deliver bytes
+    // before we fall back to reading from disk (which needs the file-URL toggle).
+    await sleep(1200);
     const cur = await chrome.storage.local.get("lastXlsxB64");
     if (cur.lastXlsxB64) {
-      await appendLog("Storage already has xlsx — disk read skipped");
+      await appendLog("Storage already has report bytes — disk read skipped");
       if (runState) runState = null;
       return;
     }
@@ -438,17 +527,18 @@ chrome.downloads.onChanged.addListener(async (delta) => {
       await setStatus("Download complete. Reading file from disk…", "info", 85);
       const buf = await readDownloadedFile(delta.id);
       if (!buf) {
-        // Auto-open the extension's details page so the user can flip the toggle.
-        const extId = chrome.runtime.id;
-        try { await chrome.tabs.create({ url: "chrome://extensions/?id=" + extId, active: true }); } catch (_) {}
-        throw new Error(
-          "Cannot read downloaded file. The Chrome page just opened — scroll to " +
-          "'Allow access to file URLs' and turn it ON, then click the extension icon again."
+        // Silently bail; do NOT auto-open chrome://extensions (annoying & racey).
+        await appendLog(
+          "Disk read failed. If no viewer opened, enable 'Allow access to file URLs' on this extension.",
+          "info"
         );
+        if (runState) runState = null;
+        return;
       }
       const b64 = arrayBufferToBase64(buf);
       await appendLog("Disk read OK — " + buf.byteLength + " bytes");
-      await deliverXlsx(b64, buf.byteLength, "disk");
+      const fmt = detectReportFormat(buf) || "xlsx";
+      await deliverXlsx(b64, buf.byteLength, "disk", fmt);
     } catch (e) {
       console.error(e);
       setBadge("ERR", "#dc3545");
@@ -492,9 +582,8 @@ async function readDownloadedFile(downloadId) {
       return null;
     }
     const buf = await resp.arrayBuffer();
-    const v = new Uint8Array(buf, 0, Math.min(4, buf.byteLength));
-    if (!(v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04)) {
-      console.warn("[sahaj-auto] file did not start with zip magic");
+    if (!detectReportFormat(buf)) {
+      console.warn("[sahaj-auto] file did not look like xlsx or csv");
       return null;
     }
     return buf;

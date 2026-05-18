@@ -17,22 +17,39 @@
     return;
   }
 
+  // Each viewer tab is locked to a specific flow via URL hash (e.g. viewer.html#todayservicing).
+  const flowKey = (location.hash || "").replace(/^#/, "") || null;
+  const xlsxKey = flowKey ? "xlsx_" + flowKey : "lastXlsxB64";
+  const tsKey = flowKey ? "xlsxTs_" + flowKey : "lastXlsxTs";
+  const titleKey = flowKey ? "flowTitle_" + flowKey : "flowTitle";
+  const formatKey = flowKey ? "xlsxFormat_" + flowKey : "lastXlsxFormat";
+
   async function tryRender() {
-    const { lastXlsxB64, lastXlsxTs } = await chrome.storage.local.get(["lastXlsxB64", "lastXlsxTs"]);
-    if (!lastXlsxB64) return false;
-    const buf = base64ToArrayBuffer(lastXlsxB64);
-    if (!looksLikeXlsx(buf)) {
-      subtitle.innerHTML = '<span class="empty">Stored data is not a valid .xlsx (zip signature missing).</span>';
-      return false;
-    }
+    const data = await chrome.storage.local.get([xlsxKey, tsKey, formatKey]);
+    const b64 = data[xlsxKey];
+    const ts = data[tsKey];
+    const format = data[formatKey] || "xlsx";
+    if (!b64) return false;
+    const buf = base64ToArrayBuffer(b64);
     let wb;
-    try { wb = XLSX.read(buf, { type: "array" }); }
-    catch (e) {
+    try {
+      if (format === "csv") {
+        // Decode bytes as text and parse as CSV. Strip UTF-8 BOM if present.
+        let text = new TextDecoder("utf-8").decode(new Uint8Array(buf));
+        if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+        wb = XLSX.read(text, { type: "string", raw: false });
+      } else {
+        if (!looksLikeXlsx(buf)) {
+          subtitle.innerHTML = '<span class="empty">Stored data is not a valid .xlsx (zip signature missing).</span>';
+          return false;
+        }
+        wb = XLSX.read(buf, { type: "array" });
+      }
+    } catch (e) {
       subtitle.innerHTML = '<span class="empty">Parse error: ' + escapeHtml(e.message) + '</span>';
       return false;
     }
-    renderWorkbook(wb, lastXlsxTs);
-    // Render succeeded — force progress to 100% so it doesn't get stuck at 75%.
+    renderWorkbook(wb, ts);
     renderProgress({ text: "Done. Data displayed.", kind: "ok", progress: 100 });
     return true;
   }
@@ -93,6 +110,13 @@
 
   // Initial paint
   (async () => {
+    const data = await chrome.storage.local.get([titleKey]);
+    const flowTitle = data[titleKey];
+    if (flowTitle) {
+      const t = document.getElementById("doc-title");
+      if (t) t.textContent = flowTitle;
+      document.title = flowTitle + " — RR Automation Service";
+    }
     const rendered = await tryRender();
     if (!rendered) subtitle.textContent = "Waiting for automation to capture the data\u2026";
     const { status } = await chrome.storage.local.get(["status"]);
@@ -102,7 +126,7 @@
   // Auto-update whenever storage changes
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
-    if (changes.lastXlsxB64 && changes.lastXlsxB64.newValue) tryRender();
+    if (changes[xlsxKey] && changes[xlsxKey].newValue) tryRender();
     if (changes.status) renderProgress(changes.status.newValue);
   });
 

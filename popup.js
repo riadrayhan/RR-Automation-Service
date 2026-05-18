@@ -21,13 +21,28 @@ refreshStatus();
 const timer = setInterval(refreshStatus, 700);
 window.addEventListener("unload", () => clearInterval(timer));
 
-$("start").addEventListener("click", async () => {
+$("start") && $("start").addEventListener("click", async () => {
   $("status").textContent = "Starting…";
-  const resp = await chrome.runtime.sendMessage({ type: "START_AUTOMATION" });
+  const resp = await chrome.runtime.sendMessage({ type: "START_AUTOMATION", flow: "todayservicing" });
   if (!resp?.ok) {
     $("status").textContent = "Error: " + (resp?.error || "unknown");
     $("status").style.color = "#dc3545";
   }
+});
+
+// Flow-selector buttons (data-flow attribute)
+document.querySelectorAll("button[data-flow]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const flow = btn.getAttribute("data-flow");
+    $("status").textContent = "Starting…";
+    const resp = await chrome.runtime.sendMessage({ type: "START_AUTOMATION", flow });
+    if (!resp?.ok) {
+      $("status").textContent = "Error: " + (resp?.error || "unknown");
+      $("status").style.color = "#dc3545";
+    } else {
+      window.close();
+    }
+  });
 });
 
 $("view").addEventListener("click", async () => {

@@ -10,10 +10,11 @@
 
   function isXlsxUrl(u) {
     return /\.xlsx?(\?|#|$)/i.test(u || "") ||
-           /export|excel/i.test(u || "");
+           /\.csv(\?|#|$)/i.test(u || "") ||
+           /export|excel|download/i.test(u || "");
   }
   function isXlsxType(ct) {
-    return /spreadsheet|excel|officedocument|application\/octet-stream/i.test(ct || "");
+    return /spreadsheet|excel|officedocument|csv|application\/octet-stream/i.test(ct || "");
   }
 
   function toB64(buf) {
@@ -27,9 +28,17 @@
   }
 
   function looksLikeXlsx(buf) {
-    if (!buf || buf.byteLength < 4) return false;
-    const v = new Uint8Array(buf, 0, 4);
-    return v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04;
+    if (!buf || buf.byteLength < 2) return false;
+    const v = new Uint8Array(buf, 0, Math.min(8, buf.byteLength));
+    if (v[0] === 0x50 && v[1] === 0x4b && v[2] === 0x03 && v[3] === 0x04) return true;
+    // CSV: printable text
+    const sample = new Uint8Array(buf, 0, Math.min(512, buf.byteLength));
+    let printable = 0;
+    for (let i = 0; i < sample.length; i++) {
+      const c = sample[i];
+      if (c === 9 || c === 10 || c === 13 || (c >= 32 && c <= 126) || c >= 160) printable++;
+    }
+    return printable / sample.length >= 0.92;
   }
 
   function postBytes(buf, sourceUrl) {
@@ -83,8 +92,8 @@
             this.response.arrayBuffer().then((b) => postBytes(b, url)).catch(() => {});
             return;
           } else if (typeof this.responseText === "string" && this.responseText.length) {
-            // Probably text, not bytes; ignore.
-            return;
+            // CSV-style text response — convert to bytes.
+            buf = new TextEncoder().encode(this.responseText).buffer;
           }
           if (buf) postBytes(buf, url);
         }
