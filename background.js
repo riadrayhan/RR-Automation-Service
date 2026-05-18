@@ -426,13 +426,41 @@ async function deliverXlsx(b64, size, sourceLabel, format) {
   setBadge("OK", "#28a745");
   await setStatus(flowTitle + " ready.", "ok", 100);
 
-  // Chain: after this flow succeeds, automatically run the next one.
+  // Chain: after this flow succeeds, automatically run the next one — but only
+  // AFTER the previous flow has fully wound down (debugger detached, any pending
+  // download.onChanged settled). Strict serial: flow 1 100% done → flow 2 starts.
   if (runState && runState.chainNext) {
     const nextFlowKey = runState.chainNext;
     const nextFlow = FLOWS[nextFlowKey];
+    const prevTabId = runState.tabId;
+    const prevDownloadId = runState.downloadId;
+
+    // Detach the previous tab's debugger NOW so its Fetch.requestPaused events
+    // can no longer block anything.
+    try { await detachDebuggerSafe(prevTabId); } catch (_) {}
+
+    // Wait up to 4s for the previous browser download (if any) to reach
+    // "complete" state so its stale onChanged fires & is rejected by the
+    // downloadIdToFlow check while we're still on the OLD flow.
+    if (prevDownloadId != null) {
+      const deadline = Date.now() + 4000;
+      while (Date.now() < deadline) {
+        try {
+          const items = await chrome.downloads.search({ id: prevDownloadId });
+          const st = items && items[0] && items[0].state;
+          if (st === "complete" || st === "interrupted") break;
+        } catch (_) { break; }
+        await sleep(200);
+      }
+      // Allow the onChanged grace-period (1.2s) to elapse so the stale-rejection
+      // path runs to completion before we mutate runState.
+      await sleep(1400);
+    } else {
+      await sleep(500);
+    }
+
     runState = null;
-    await sleep(800);
-    await appendLog("Chaining to next flow: " + nextFlowKey);
+    await appendLog("Previous flow fully wound down — chaining to: " + nextFlowKey);
     const creds = await getCreds();
     if (creds && nextFlow) await startAutomation(creds, nextFlowKey, null);
   }
