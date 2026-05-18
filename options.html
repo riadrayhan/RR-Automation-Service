@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>RR Automation Service — Options</title>
+  <style>
+    body { font-family: Segoe UI, Roboto, sans-serif; max-width: 420px; margin: 30px auto; padding: 16px; }
+    h2 { color: #00acd6; }
+    label { display:block; margin-top: 12px; font-size: 13px; color: #333; }
+    input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 3px; font-size: 14px; }
+    button { margin-top: 16px; background:#00c0ef; border:1px solid #00acd6; color:#fff; padding:8px 14px; border-radius:3px; cursor:pointer; }
+    .note { margin-top: 12px; color:#a00; font-size: 12px; }
+    .ok { color:#28a745; font-size: 12px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <h2>Credentials</h2>
+  <p>Stored locally in <code>chrome.storage.local</code>. Anyone with access to this browser profile can read them — do not use on a shared device.</p>
+  <label>Username <input id="u" type="text" autocomplete="off"></label>
+  <label>Password <input id="p" type="password" autocomplete="off"></label>
+  <button id="save">Save</button>
+  <div class="ok" id="msg"></div>
+  <script src="options.js"></script>
+</body>
+</html>

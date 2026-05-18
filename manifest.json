@@ -1,0 +1,50 @@
+{
+  "manifest_version": 3,
+  "name": "RR Automation Service",
+  "version": "1.0.0",
+  "description": "Auto-login to sahajmobile.com, click the Excel export, and display downloaded rows serially.",
+  "permissions": [
+    "storage",
+    "downloads",
+    "scripting",
+    "tabs",
+    "cookies",
+    "activeTab",
+    "debugger"
+  ],
+  "host_permissions": [
+    "https://sahajmobile.com/*",
+    "file:///*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "RR Automation Service — Click to run"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": ["https://sahajmobile.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://sahajmobile.com/*"],
+      "js": ["page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["libs/xlsx.full.min.js", "viewer.html", "viewer.js"],
+      "matches": ["https://sahajmobile.com/*"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

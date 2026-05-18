@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>RR Automation Service</title>
+  <style>
+    :root { --ink:#1a1a1a; --muted:#666; --accent:#00acd6; --rule:#d8d8d8; }
+    html, body { margin:0; padding:0; background:#e8eaed; }
+    body {
+      font-family: "Calibri", "Segoe UI", Arial, sans-serif;
+      color: var(--ink);
+      padding: 24px 0 60px;
+    }
+    .toolbar {
+      max-width: 8.5in; margin: 0 auto 16px; display:flex; gap:8px;
+      align-items:center; padding: 0 12px;
+    }
+    .toolbar select, .toolbar button {
+      padding: 6px 10px; border:1px solid #bbb; border-radius:3px;
+      background:#fff; cursor:pointer; font-size:13px;
+    }
+    .toolbar button.primary { background: var(--accent); color:#fff; border-color: #009ec3; }
+    .toolbar .spacer { flex:1; }
+    .toolbar .meta { color: var(--muted); font-size:12px; }
+
+    /* Word-document page */
+    .page {
+      width: 8.5in;
+      min-height: 11in;
+      margin: 0 auto 24px;
+      background: #fff;
+      padding: 0.9in 0.9in 1in;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.18), 0 8px 24px rgba(0,0,0,0.08);
+      box-sizing: border-box;
+    }
+    .doc-title {
+      font-family: "Cambria", "Georgia", serif;
+      font-size: 26pt; font-weight: 600; color: #2e74b5;
+      margin: 0 0 4px;
+    }
+    .doc-sub { color: var(--muted); font-size: 11pt; margin-bottom: 18pt; }
+    .doc-h1 {
+      font-family: "Cambria", "Georgia", serif;
+      font-size: 16pt; color:#2e74b5; margin: 14pt 0 8pt;
+      border-bottom: 1px solid var(--rule); padding-bottom: 4px;
+    }
+    table.data {
+      width: 100%; border-collapse: collapse; font-size: 10.5pt;
+    }
+    table.data th, table.data td {
+      border: 1px solid var(--rule); padding: 6px 8px; vertical-align: top;
+      text-align: left;
+    }
+    table.data thead th {
+      background:#f2f8fb; color:#2e74b5; font-weight:600;
+    }
+    table.data tbody tr:nth-child(even) { background:#fbfdfe; }
+    .serial {
+      width: 36px; text-align:center; color:#2e74b5; font-weight:600;
+    }
+
+    /* Serial paragraph view */
+    .para-list { counter-reset: row; }
+    .para {
+      padding: 8px 0; border-bottom: 1px dotted var(--rule);
+      font-size: 11pt; line-height: 1.55;
+    }
+    .para::before {
+      counter-increment: row;
+      content: counter(row) ". ";
+      font-weight: 600; color:#2e74b5; margin-right: 4px;
+    }
+    .kv { color: var(--muted); }
+    .kv b { color: var(--ink); font-weight: 600; }
+    .empty { color:#a00; padding: 24px; text-align:center; }
+    .progress-wrap {
+      max-width: 8.5in; margin: 0 auto 14px; padding: 10px 14px;
+      background:#fff; border:1px solid #dde2e7; border-radius:4px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.06);
+      font-size: 12px; color:#555;
+    }
+    .progress-wrap.hidden { display:none; }
+    .progress-wrap .label { display:flex; justify-content:space-between; margin-bottom:6px; }
+    .pbar { height: 10px; background:#eef2f5; border-radius:5px; overflow:hidden;
+            border:1px solid #dde2e7; }
+    .pbar > div {
+      height:100%; width:0; background:linear-gradient(90deg,#00c0ef,#00acd6);
+      transition: width .4s ease; border-radius:5px;
+    }
+    .pbar.ok > div { background:linear-gradient(90deg,#28a745,#1d8a39); }
+    .pbar.error > div { background:linear-gradient(90deg,#dc3545,#b02635); }
+    @media print {
+      body { background:#fff; }
+      .toolbar, .progress-wrap, .logwrap { display:none; }
+      .page { box-shadow:none; margin:0; width:auto; min-height:auto; }
+    }
+    .logwrap {
+      max-width: 8.5in; margin: 0 auto 14px;
+      background:#0f1115; color:#cfd6df; border-radius:4px;
+      box-shadow: 0 1px 2px rgba(0,0,0,.08); font-family: Consolas, "Courier New", monospace;
+      font-size: 11.5px;
+    }
+    .logwrap .head {
+      display:flex; align-items:center; gap:10px; padding: 8px 12px;
+      border-bottom:1px solid #232730; color:#9aa4b2;
+    }
+    .logwrap .head b { color:#7fd1ff; font-family: "Segoe UI", sans-serif; font-weight:600; }
+    .logwrap button {
+      margin-left:auto; padding:3px 8px; border:1px solid #3a4350;
+      background:#1a1f27; color:#cfd6df; border-radius:3px; cursor:pointer; font-size:11px;
+    }
+    .logwrap .body { max-height: 180px; overflow:auto; padding: 8px 12px; }
+    .logwrap .ln { white-space: pre-wrap; word-break: break-all; padding: 1px 0; }
+    .logwrap .ln.error { color:#ff8a92; }
+    .logwrap .ln.ok    { color:#9be79b; }
+    .logwrap .ts { color:#5d6675; margin-right: 6px; }
+  </style>
+</head>
+<body>
+  <div class="progress-wrap hidden" id="progress-wrap">
+    <div class="label"><span id="progress-text">Idle</span><span id="progress-pct">0%</span></div>
+    <div class="pbar" id="pbar"><div id="pbar-fill"></div></div>
+  </div>
+
+  <div class="page" id="page">
+    <div class="doc-title">RR Automation Service</div>
+    <div class="doc-sub" id="subtitle">Waiting for data…</div>
+    <div id="body"></div>
+  </div>
+
+  <script src="libs/xlsx.full.min.js"></script>
+  <script src="viewer.js"></script>
+</body>
+</html>
